@@ -51,8 +51,15 @@ static int client_sockfd;
 static struct sockaddr_un client_addr;
 static int last_state = -1;
 
-static bool low_power_mode = false;
-static pthread_mutex_t low_power_mode_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t profile_lock = PTHREAD_MUTEX_INITIALIZER;
+
+enum {
+    PROFILE_POWER_SAVE = 0,
+    PROFILE_BALANCED,
+    PROFILE_HIGH_PERFORMANCE
+};
+
+static int current_power_profile = PROFILE_BALANCED;
 
 static void socket_init()
 {
@@ -177,7 +184,6 @@ static void process_video_encode_hint(void *metadata)
     }
 }
 
-
 static void touch_boost()
 {
     int rc;
@@ -215,10 +221,47 @@ static void power_set_interactive(__attribute__((unused)) struct power_module *m
     }
 }
 
+static void set_power_profile(int profile) {
+    int min_freq, max_freq;
+
+    ALOGV("%s: profile=%d", __func__, profile);
+
+    if (profile == PROFILE_BALANCED) {
+        min_freq = LOW_POWER_MIN_FREQ;
+        max_freq = NORMAL_MAX_FREQ;
+        ALOGD("%s: set balanced mode", __func__);
+    } else if (profile == PROFILE_HIGH_PERFORMANCE) {
+        min_freq = NORMAL_MAX_FREQ;
+        max_freq = NORMAL_MAX_FREQ;
+        ALOGD("%s: set performance mode", __func__);
+    } else if (profile == PROFILE_POWER_SAVE) {
+        min_freq = LOW_POWER_MIN_FREQ;
+        max_freq = LOW_POWER_MAX_FREQ;
+        ALOGD("%s: set powersave", __func__);
+    }
+
+    sysfs_write(MIN_FREQ_LIMIT_PATH, min_freq);
+    sysfs_write(MAX_FREQ_LIMIT_PATH, max_freq);
+
+    current_power_profile = profile;
+}
+
 static void power_hint( __attribute__((unused)) struct power_module *module,
                       power_hint_t hint, __attribute__((unused)) void *data)
 {
     int cpu, ret;
+
+    if (hint == POWER_HINT_SET_PROFILE) {
+        pthread_mutex_lock(&profile_lock);
+        set_power_profile(*(int32_t *)data);
+        pthread_mutex_lock(&profile_lock);
+        return;
+    }
+
+    // Skip other hints in custom power modes
+    if (current_power_profile != PROFILE_BALANCED) {
+        return;
+    }
 
     switch (hint) {
         case POWER_HINT_LAUNCH_BOOST:
@@ -230,19 +273,6 @@ static void power_hint( __attribute__((unused)) struct power_module *module,
         case POWER_HINT_VIDEO_ENCODE:
             process_video_encode_hint(data);
             break;
-
-        case POWER_HINT_LOW_POWER:
-            pthread_mutex_lock(&low_power_mode_lock);
-            if (data) {
-                low_power_mode = true;
-                sysfs_write(MIN_FREQ_LIMIT_PATH, LOW_POWER_MIN_FREQ);
-                sysfs_write(MAX_FREQ_LIMIT_PATH, LOW_POWER_MAX_FREQ);
-            } else {
-                low_power_mode = false;
-                sysfs_write(MAX_FREQ_LIMIT_PATH, NORMAL_MAX_FREQ);
-            }
-            pthread_mutex_unlock(&low_power_mode_lock);
-            break;
         default:
             break;
     }
@@ -252,6 +282,15 @@ static struct hw_module_methods_t power_module_methods = {
     .open = NULL,
 };
 
+static int get_feature(__attribute__((unused)) struct power_module *module,
+                       feature_t feature)
+{
+    if (feature == POWER_FEATURE_SUPPORTED_PROFILES)
+        return 3;
+
+    return -1;
+}
+
 struct power_module HAL_MODULE_INFO_SYM = {
     .common = {
         .tag = HARDWARE_MODULE_TAG,
@@ -259,11 +298,12 @@ struct power_module HAL_MODULE_INFO_SYM = {
         .hal_api_version = HARDWARE_HAL_API_VERSION,
         .id = POWER_HARDWARE_MODULE_ID,
         .name = "Flo/Deb Power HAL",
-        .author = "The Android Open Source Project",
+        .author = "The CyanogenMod Project",
         .methods = &power_module_methods,
     },
 
     .init = power_init,
     .setInteractive = power_set_interactive,
     .powerHint = power_hint,
+    .getFeature = get_feature
 };
